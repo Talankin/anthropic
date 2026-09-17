@@ -20,8 +20,180 @@ public class Agent {
     private final Calculator calculator = new Calculator();
 
     public String start() {
+        // TODO: работу над Integer числами переделать на операции с плавающей точкой,
+        //  т.к. агент не использует свой калькулятор вместо моего для подсчета процентов
+
+        /*
+            работает. здесь используются два тулза калькулятор + web поиск в агентском цикле
+            и только проверка двух стоп-ризонов: end_turn & tool_use
+            в калькуляторе заведомо отсутствует оператор '%',
+            чтобы поймать ошибку внутри агентского цикла
+        */
+
+        final Tool webSearchTool = createWebSearchTool();
+        final Tool calculatorTool = createCalculatorTool();
+        final ToolChoiceAuto toolChoice = ToolChoiceAuto.builder()
+                .disableParallelToolUse(true)
+                .build();
+        final String userPrompt = "на сколько процентов и в какую сторону изменилась численность населения Боржоми в 2025 году по сравнению с 1976?";
+
+        System.out.println("start agent");
+
+        int i = 0;
+        int maxIterations = 20;
+        String finalAnswer = null;
+        List<MessageParam> messageHistory = new ArrayList<>();
+        messageHistory.add(MessageParam.builder()
+                .role(USER)
+                .content(userPrompt)
+                .build());
+
+        while (i < maxIterations) {
+            Message response = client.messages().create(MessageCreateParams.builder()
+                    .model(Model.CLAUDE_SONNET_5)
+                    .maxTokens(500)
+                    .addTool(webSearchTool)
+                    .addTool(calculatorTool)
+                    .toolChoice(toolChoice)
+                    .messages(messageHistory) // добавить всю историю одним вызовом
+                    .build());
+
+            messageHistory.add(response.toParam()); // добавить ответ ассистента в историю
+
+            String stopReason = response.stopReason().map(StopReason::asString).orElse(null);
+            System.out.println("stop_reason: " + stopReason);
+
+            if (END_TURN.asString().equalsIgnoreCase(stopReason)
+                    || !TOOL_USE.asString().equalsIgnoreCase(stopReason)) {
+                final String text = parseAnswers(response);
+                finalAnswer = text;
+                System.out.println("response content: " + text);
+
+                break;
+            }
+
+            ToolUseBlock toolUseBlock = response.content().stream()
+                    .flatMap(block -> block.toolUse().stream())
+                    .findFirst()
+                    .orElse(null);
+
+            String toolResult = "";
+            boolean isError = false;
+            if (toolUseBlock != null) {
+                System.out.println("Claude called " + toolUseBlock.name() + " with " + toolUseBlock._input());
+                if (toolUseBlock.name().equals("calculator")) {
+                    try {
+                        toolResult = calculate(toolUseBlock);
+                    } catch (RuntimeException e) {
+                        toolResult = e.getMessage();
+                        isError = true;
+                    }
+                }
+
+                if (toolUseBlock.name().equals("web_search")) {
+                    toolResult = webSearch(toolUseBlock);
+                } else {
+                    toolResult = "unknown tool: " + toolUseBlock.name();
+                    isError = true;
+                    System.out.println(toolResult);
+                }
+                
+                messageHistory.add(MessageParam.builder() // добавить ответ юзера(результат тула) в историю
+                        .role(USER)
+                        .contentOfBlockParams(List.of(ContentBlockParam.ofToolResult(
+                                ToolResultBlockParam.builder()
+                                        .toolUseId(toolUseBlock.id())
+                                        .content(toolResult)
+                                        .isError(isError)
+                                        .build())))
+                        .build());
+            }
+
+            i++;
+            if (i == maxIterations) {
+                System.out.println("max iterations reached, stop agent. seems like agent loop is infinite");
+            }
+        }
+
+        return finalAnswer;
+    }
+
+    private String webSearch(ToolUseBlock toolUseBlock) {
+        return "В 1976 году численность населения города Боржоми " +
+                "вместе с подчиненными поселками района составляла около 18 тысяч человек " +
+                "(по данным переписи 1979 года в самом городе Боржоми было 18 059 жителей). " +
+                "К 2025 году население непосредственно самого города оценивается примерно в 14 тысяч человек " +
+                "(по официальным данным Википедии на 2023 год зафиксировано 11 194 человека)";
+    }
+
+    private String calculate(ToolUseBlock toolUseBlock) {
+        final Map<String, JsonValue> inputValues = ((JsonObject) toolUseBlock._input()).values();
+        final Integer number1 = inputValues.get("number1").convert(Integer.class);
+        final Integer number2 = inputValues.get("number2").convert(Integer.class);
+        final String operation = inputValues.get("operation").convert(String.class);
+
+        return calculator.calculate(number1, number2, operation);
+    }
+
+    private Tool createCalculatorTool() {
+        return Tool.builder()
+                .name("calculator")
+                .description("Calculate two numbers.")
+                .inputSchema(Tool.InputSchema.builder()
+                        .properties(JsonValue.from(Map.of(
+                                "number1", Map.of(
+                                        "type", "integer",
+                                        "description", "the first number to add"
+                                ),
+                                "number2", Map.of(
+                                        "type", "integer",
+                                        "description", "the second number to add"
+                                ),
+                                "operation", Map.of(
+                                        "type", "string",
+                                        "enum", List.of("+", "-", "*", "/", "%"),
+                                        "description", "the operation to apply to number1 and number2: "
+                                                + "'+' addition, '-' subtraction, '*' multiplication, "
+                                                + "'/' integer division (truncated, 2/3 = 0), "
+                                                + "'%' remainder of integer division (modulo), not percent"
+                                )
+                        )))
+                        .required(List.of("number1", "number2", "operation"))
+                        .build())
+                .build();
+    }
+
+    private Tool createWebSearchTool() {
+        return Tool.builder()
+                .name("web_search")
+                .description("Find information on the web.")
+                .inputSchema(Tool.InputSchema.builder()
+                        .properties(JsonValue.from(Map.of(
+                                "query", Map.of(
+                                        "type", "string",
+                                        "description", "search query to find information on the web"
+                                ))))
+                        .required(List.of("query"))
+                        .build())
+                .build();
+    }
+
+    private String parseAnswers(Message response) {
+        final List<String> answers = response.content().stream()
+                .map(ContentBlock::text)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .map(TextBlock::text)
+                .toList();
+
+        return String.join(System.lineSeparator(), answers);
+    }
+
+    private String start4() {
         // работает. здесь только калькулятор в агентском цикле
-        // и только проверка двух стоп-ризонов: end_turn & tool_use
+        // и только проверка двух стоп-ризонов: end_turn & tool_use.
+        // в калькуляторе заведомо отсутствует оператор '%',
+        // чтобы поймать ошибку внутри агентского цикла
         final Tool calculatorTool = createCalculatorTool();
         final ToolChoiceAuto toolChoice = ToolChoiceAuto.builder()
                 .disableParallelToolUse(true)
@@ -92,54 +264,6 @@ public class Agent {
         }
 
         return "";
-    }
-
-    private String calculate(ToolUseBlock toolUseBlock) {
-        final Map<String, JsonValue> inputValues = ((JsonObject) toolUseBlock._input()).values();
-        final Integer number1 = inputValues.get("number1").convert(Integer.class);
-        final Integer number2 = inputValues.get("number2").convert(Integer.class);
-        final String operation = inputValues.get("operation").convert(String.class);
-
-        return calculator.calculate(number1, number2, operation);
-    }
-
-    private Tool createCalculatorTool() {
-        return Tool.builder()
-                .name("calculator")
-                .description("Calculate two numbers.")
-                .inputSchema(Tool.InputSchema.builder()
-                        .properties(JsonValue.from(Map.of(
-                                "number1", Map.of(
-                                        "type", "integer",
-                                        "description", "the first number to add"
-                                ),
-                                "number2", Map.of(
-                                        "type", "integer",
-                                        "description", "the second number to add"
-                                ),
-                                "operation", Map.of(
-                                        "type", "string",
-                                        "enum", List.of("+", "-", "*", "/", "%"),
-                                        "description", "the operation to apply to number1 and number2: "
-                                                + "'+' addition, '-' subtraction, '*' multiplication, "
-                                                + "'/' integer division (truncated, 2/3 = 0), "
-                                                + "'%' remainder of integer division (modulo), not percent"
-                                )
-                        )))
-                        .required(List.of("number1", "number2", "operation"))
-                        .build())
-                .build();
-    }
-
-    private String parseAnswers(Message response) {
-        final List<String> answers = response.content().stream()
-                .map(ContentBlock::text)
-                .filter(Optional::isPresent)
-                .map(Optional::get)
-                .map(TextBlock::text)
-                .toList();
-
-        return String.join(System.lineSeparator(), answers);
     }
 
     private String start3() {
