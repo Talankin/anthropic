@@ -7,6 +7,11 @@ import com.anthropic.models.messages.*;
 import io.github.cdimascio.dotenv.*;
 
 import java.util.*;
+import java.util.stream.*;
+
+import static com.anthropic.models.messages.MessageParam.Role.USER;
+import static com.anthropic.models.messages.StopReason.END_TURN;
+import static com.anthropic.models.messages.StopReason.TOOL_USE;
 
 public class Agent {
     private final Dotenv dotenv = Dotenv.load();
@@ -15,6 +20,130 @@ public class Agent {
     private final Calculator calculator = new Calculator();
 
     public String start() {
+        // работает. здесь только калькулятор в агентском цикле
+        // и только проверка двух стоп-ризонов: end_turn & tool_use
+        final Tool calculatorTool = createCalculatorTool();
+        final ToolChoiceAuto toolChoice = ToolChoiceAuto.builder()
+                .disableParallelToolUse(true)
+                .build();
+        final String userPrompt = "какой будет остаток от деления 2 и 3?";
+
+        System.out.println("start agent");
+
+
+        int i = 0;
+        int maxIterations = 10;
+        List<MessageParam> messageHistory = new ArrayList<>();
+        messageHistory.add(MessageParam.builder()
+                .role(USER)
+                .content(userPrompt)
+                .build());
+
+        while (i < maxIterations) {
+            Message response = client.messages().create(MessageCreateParams.builder()
+                    .model(Model.CLAUDE_SONNET_5)
+                    .maxTokens(500)
+                    .addTool(calculatorTool)
+                    .toolChoice(toolChoice)
+                    .messages(messageHistory) // добавить всю историю одним вызовом
+                    .build());
+
+            messageHistory.add(response.toParam()); // добавить ответ ассистента в историю
+
+            String stopReason = response.stopReason().map(StopReason::asString).orElse(null);
+            if (END_TURN.asString().equalsIgnoreCase(stopReason)
+                    || !TOOL_USE.asString().equalsIgnoreCase(stopReason)) {
+                final String text = parseAnswers(response);
+                System.out.println("stop_reason: " + stopReason);
+                System.out.println("response content: " + text);
+
+                break;
+            }
+
+            ToolUseBlock toolUseBlock = response.content().stream()
+                    .flatMap(block -> block.toolUse().stream())
+                    .findFirst()
+                    .orElse(null);
+
+            System.out.println("stop_reason: " + stopReason);
+
+            String calculatedResult;
+            boolean isError = false;
+            if (toolUseBlock != null) {
+                System.out.println("Claude called " + toolUseBlock.name() + " with " + toolUseBlock._input());
+                try {
+                    calculatedResult = calculate(toolUseBlock);
+                } catch (RuntimeException e) {
+                    calculatedResult = e.getMessage();
+                    isError = true;
+                }
+                messageHistory.add(MessageParam.builder() // добавить ответ юзера(результат тула) в историю
+                        .role(USER)
+                        .contentOfBlockParams(List.of(ContentBlockParam.ofToolResult(
+                                ToolResultBlockParam.builder()
+                                        .toolUseId(toolUseBlock.id())
+                                        .content(calculatedResult)
+                                        .isError(isError)
+                                        .build())))
+                        .build());
+            }
+
+            i++;
+        }
+
+        return "";
+    }
+
+    private String calculate(ToolUseBlock toolUseBlock) {
+        final Map<String, JsonValue> inputValues = ((JsonObject) toolUseBlock._input()).values();
+        final Integer number1 = inputValues.get("number1").convert(Integer.class);
+        final Integer number2 = inputValues.get("number2").convert(Integer.class);
+        final String operation = inputValues.get("operation").convert(String.class);
+
+        return calculator.calculate(number1, number2, operation);
+    }
+
+    private Tool createCalculatorTool() {
+        return Tool.builder()
+                .name("calculator")
+                .description("Calculate two numbers.")
+                .inputSchema(Tool.InputSchema.builder()
+                        .properties(JsonValue.from(Map.of(
+                                "number1", Map.of(
+                                        "type", "integer",
+                                        "description", "the first number to add"
+                                ),
+                                "number2", Map.of(
+                                        "type", "integer",
+                                        "description", "the second number to add"
+                                ),
+                                "operation", Map.of(
+                                        "type", "string",
+                                        "enum", List.of("+", "-", "*", "/", "%"),
+                                        "description", "the operation to apply to number1 and number2: "
+                                                + "'+' addition, '-' subtraction, '*' multiplication, "
+                                                + "'/' integer division (truncated, 2/3 = 0), "
+                                                + "'%' remainder of integer division (modulo), not percent"
+                                )
+                        )))
+                        .required(List.of("number1", "number2", "operation"))
+                        .build())
+                .build();
+    }
+
+    private String parseAnswers(Message response) {
+        final List<String> answers = response.content().stream()
+                .map(ContentBlock::text)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .map(TextBlock::text)
+                .toList();
+
+        return String.join(System.lineSeparator(), answers);
+    }
+
+    private String start3() {
+        // не работает. не происходит накопления опыта использования тула. поэтому бесконечный цикл
         final Tool calculatorTool = createCalculatorTool();
         final ToolChoiceAuto toolChoice = ToolChoiceAuto.builder()
                 .disableParallelToolUse(true)
@@ -89,7 +218,8 @@ public class Agent {
         return "";
     }
 
-    public String start2() {
+    private String start2() {
+        // работает. сингл операция без агентского цикла
         System.out.println("start agent");
 
         Tool calculatorTool = Tool.builder()
@@ -188,7 +318,8 @@ public class Agent {
         return "";
     }
 
-    public String start1() {
+    private String start1() {
+        // работает. сингл операция без агентского цикла
         System.out.println("start agent");
 
         final MessageCreateParams params = MessageCreateParams.builder()
@@ -202,47 +333,7 @@ public class Agent {
         System.out.println(response.content());
         int i = 0;
 
-//        while (i < 1000) {
-//            i++;
-//        }
-
         return "stop agent, result:" + " i:" + i + " stopReason:" + stopReason;
     }
 
-    private String calculate(ToolUseBlock toolUseBlock) {
-        final Map<String, JsonValue> inputValues = ((JsonObject) toolUseBlock._input()).values();
-        final Integer number1 = inputValues.get("number1").convert(Integer.class);
-        final Integer number2 = inputValues.get("number2").convert(Integer.class);
-        final String operation = inputValues.get("operation").convert(String.class);
-
-        return calculator.calculate(number1, number2, operation);
-    }
-
-    private Tool createCalculatorTool() {
-        return Tool.builder()
-                .name("calculator")
-                .description("Calculate two numbers.")
-                .inputSchema(Tool.InputSchema.builder()
-                        .properties(JsonValue.from(Map.of(
-                                "number1", Map.of(
-                                        "type", "integer",
-                                        "description", "the first number to add"
-                                ),
-                                "number2", Map.of(
-                                        "type", "integer",
-                                        "description", "the second number to add"
-                                ),
-                                "operation", Map.of(
-                                        "type", "string",
-                                        "enum", List.of("+", "-", "*", "/", "%"),
-                                        "description", "the operation to apply to number1 and number2: "
-                                                + "'+' addition, '-' subtraction, '*' multiplication, "
-                                                + "'/' integer division (truncated, 2/3 = 0), "
-                                                + "'%' remainder of integer division (modulo), not percent"
-                                )
-                        )))
-                        .required(List.of("number1", "number2", "operation"))
-                        .build())
-                .build();
-    }
 }
